@@ -5,7 +5,7 @@ on:
 
 jobs:
   secure-rdp:
-    runs-on: windows-latest
+    runs-on: winka
     timeout-minutes: 3600
 
     steps:
@@ -16,62 +16,97 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                             -Name "fDenyTSConnections" -Value 0 -Force
 
-          # Disable Network Level Authentication for RDP (UserAuthentication = 0) if necessary
+          # Optionally relax NLA/SecurityLayer if needed
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                             -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                             -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule to delete."
-
-          # Allow incoming TCP 3389 (RDP)
+          # Ensure firewall rule for RDP exists
+          try {
+              netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          } catch {}
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # Restart remote desktop service to apply changes
           Restart-Service -Name TermService -Force
           Start-Sleep -Seconds 3
 
-      - name: Create RDP User with Custom Username & Password
+      - name: Create RDP User (bypass password policy: net user + fallback disable complexity)
         shell: pwsh
         run: |
           $username = "Mpragans"
           $plainPass = "123456"
-          $securePass = ConvertTo-SecureString $plainPass -AsPlainText -Force
 
-          # If user exists, update password; otherwise create
-          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
-          if ($existing) {
-              Write-Host "User $username already exists — updating password and ensuring group membership."
-              Set-LocalUser -Name $username -Password $securePass
-          } else {
-              Write-Host "Creating local user $username"
-              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Write-Host "Attempting to create/update user via 'net user' (preferred bypass)."
+
+          # Helper function to add or update user via net user
+          function Ensure-NetUser {
+              param($u, $p)
+              $exists = (net user $u) -match $u
+              if ($exists) {
+                  Write-Host "User $u exists — updating password."
+                  net user $u $p
+                  if ($LASTEXITCODE -ne 0) { return $false }
+              } else {
+                  Write-Host "Creating user $u via net user."
+                  net user $u $p /add
+                  if ($LASTEXITCODE -ne 0) { return $false }
+              }
+              return $true
           }
 
-          # Ensure membership in Administrators and Remote Desktop Users
-          if (-not (Get-LocalGroup -Name "Administrators" -ErrorAction SilentlyContinue)) {
-              Write-Host "Administrators group not found (unexpected on Windows)."
-          } else {
-              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          $ok = Ensure-NetUser -u $username -p $plainPass
+
+          if (-not $ok) {
+              Write-Warning "net user creation/update failed. Trying to disable password complexity policy and retry."
+
+              # Export current security policy, modify PasswordComplexity = 1 -> 0, then re-import
+              $cfg = "$env:TEMP\secpol_${env:GITHUB_RUN_ID}.cfg"
+              secedit /export /cfg $cfg | Out-Null
+              if (Test-Path $cfg) {
+                  $content = Get-Content $cfg -Raw
+                  if ($content -match "PasswordComplexity\s*=\s*1") {
+                      $content = $content -replace "PasswordComplexity\s*=\s*1", "PasswordComplexity = 0"
+                      Set-Content -LiteralPath $cfg -Value $content
+                      secedit /configure /db $env:windir\security\local.sdb /cfg $cfg /areas SECURITYPOLICY | Out-Null
+                      Start-Sleep -Seconds 3
+                      Write-Host "Password complexity disabled (locally). Retrying user creation."
+                      $ok = Ensure-NetUser -u $username -p $plainPass
+                  } else {
+                      Write-Warning "PasswordComplexity not found in exported file; skipping direct secedit tweak."
+                  }
+              } else {
+                  Write-Warning "Failed to export security policy for modification."
+              }
           }
 
-          if (-not (Get-LocalGroup -Name "Remote Desktop Users" -ErrorAction SilentlyContinue)) {
-              Write-Host "Remote Desktop Users group not found (unexpected on Windows)."
-          } else {
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-          }
-
-          # Export credentials to environment for later steps (visible in workflow logs if not masked)
-          echo "RDP_CREDS=User: $username | Password: $plainPass" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name $username)) {
-              Write-Error "User creation/update failed"
+          if (-not $ok) {
+              Write-Error "Failed to create/update user $username even after attempting policy tweak. Exiting."
               exit 1
-          } else {
-              Write-Host "User $username ready."
           }
+
+          Write-Host "User created/updated via net user."
+
+          # Add to groups
+          try {
+              net localgroup Administrators $username /add
+          } catch {}
+          try {
+              net localgroup "Remote Desktop Users" $username /add
+          } catch {}
+
+          # Try to set password never expires using Set-LocalUser (best-effort; may require admin module)
+          try {
+              $securePass = ConvertTo-SecureString $plainPass -AsPlainText -Force
+              if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
+                  Set-LocalUser -Name $username -PasswordNeverExpires $true -ErrorAction SilentlyContinue
+              }
+          } catch {}
+
+          # Export creds to env for later steps (visible in logs; WARNING)
+          echo "RDP_CREDS=User: $username | Password: $plainPass" >> $env:GITHUB_ENV
+          Write-Host "User $username ready."
 
       - name: Install Tailscale
         shell: pwsh

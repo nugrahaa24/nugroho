@@ -1,0 +1,119 @@
+name: Mpragans RDP
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: winku
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          try { netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null } catch {}
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 3
+
+      - name: Create RDP User (net user bypass + fallback)
+        shell: pwsh
+        run: |
+          $username = "Mpragans"
+          $plainPass = "123456"
+
+          Write-Host "Try create/update via net user..."
+          function Ensure-NetUser {
+              param($u, $p)
+              $exists = (net user $u) -match $u
+              if ($exists) {
+                  net user $u $p
+                  return $LASTEXITCODE -eq 0
+              } else {
+                  net user $u $p /add
+                  return $LASTEXITCODE -eq 0
+              }
+          }
+
+          $ok = Ensure-NetUser -u $username -p $plainPass
+          if (-not $ok) {
+              Write-Warning "net user failed — attempting to disable PasswordComplexity and retry..."
+              $cfg = "$env:TEMP\secpol_${env:GITHUB_RUN_ID}.cfg"
+              secedit /export /cfg $cfg | Out-Null
+              if (Test-Path $cfg) {
+                  $content = Get-Content $cfg -Raw
+                  if ($content -match "PasswordComplexity\s*=\s*1") {
+                      $content = $content -replace "PasswordComplexity\s*=\s*1", "PasswordComplexity = 0"
+                      Set-Content -LiteralPath $cfg -Value $content
+                      secedit /configure /db $env:windir\security\local.sdb /cfg $cfg /areas SECURITYPOLICY | Out-Null
+                      Start-Sleep -Seconds 3
+                      $ok = Ensure-NetUser -u $username -p $plainPass
+                  } else {
+                      Write-Warning "PasswordComplexity not set to 1; cannot modify."
+                  }
+              } else {
+                  Write-Warning "Failed to export local security policy."
+              }
+          }
+
+          if (-not $ok) { Write-Error "Failed to create/update user $username"; exit 1 }
+
+          net localgroup Administrators $username /add || Write-Host "Add to Administrators maybe failed (already present)"
+          net localgroup "Remote Desktop Users" $username /add || Write-Host "Add to Remote Desktop Users maybe failed"
+
+          echo "RDP_CREDS=User: $username | Password: $plainPass" >> $env:GITHUB_ENV
+          Write-Host "User ready."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection (hardcoded authkey)
+        shell: pwsh
+        run: |
+          $authKey = "tskey-auth-kMdmzAe9er11CNTRL-HbEZn81BopT5QTQn1dXHpT2BjJzdxiuy"
+          $tailscaleExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscaleExe)) { Write-Error "Tailscale exe not found"; exit 1 }
+          & $tailscaleExe up --authkey=$authKey --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null; $retries=0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & $tailscaleExe ip -4
+              $tsIP = $tsIP.Trim()
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 5; $retries++
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP connection failed"; exit 1 }
+          Write-Host "TCP connectivity to RDP successful."
+
+      - name: Maintain Connection (display)
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: Mpragans"
+          Write-Host "Password: 123456"
+          Write-Host "==================`n"
+          while ($true) { Write-Host "RDP Active - cancel workflow to stop"; Start-Sleep -Seconds 300 }

@@ -1,0 +1,147 @@
+name: Mpragans RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop (allow connections)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Disable Network Level Authentication for RDP (UserAuthentication = 0) if necessary
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                            -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule to delete."
+
+          # Allow incoming TCP 3389 (RDP)
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Restart remote desktop service to apply changes
+          Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 3
+
+      - name: Create RDP User with Custom Username & Password
+        shell: pwsh
+        run: |
+          $username = "Mpragans"
+          $plainPass = "123456"
+          $securePass = ConvertTo-SecureString $plainPass -AsPlainText -Force
+
+          # If user exists, update password; otherwise create
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ($existing) {
+              Write-Host "User $username already exists — updating password and ensuring group membership."
+              Set-LocalUser -Name $username -Password $securePass
+          } else {
+              Write-Host "Creating local user $username"
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          }
+
+          # Ensure membership in Administrators and Remote Desktop Users
+          if (-not (Get-LocalGroup -Name "Administrators" -ErrorAction SilentlyContinue)) {
+              Write-Host "Administrators group not found (unexpected on Windows)."
+          } else {
+              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          }
+
+          if (-not (Get-LocalGroup -Name "Remote Desktop Users" -ErrorAction SilentlyContinue)) {
+              Write-Host "Remote Desktop Users group not found (unexpected on Windows)."
+          } else {
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          }
+
+          # Export credentials to environment for later steps (visible in workflow logs if not masked)
+          echo "RDP_CREDS=User: $username | Password: $plainPass" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name $username)) {
+              Write-Error "User creation/update failed"
+              exit 1
+          } else {
+              Write-Host "User $username ready."
+          }
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Downloading Tailscale installer..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Write-Host "Installing Tailscale (msi)..."
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed."
+
+      - name: Establish Tailscale Connection (hardcoded authkey)
+        shell: pwsh
+        run: |
+          # ***** HARDCODED AUTH KEY (INSECURE) *****
+          $authKey = "tskey-auth-kMdmzAe9er11CNTRL-HbEZn81BopT5QTQn1dXHpT2BjJzdxiuy"
+
+          $tailscaleExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscaleExe)) {
+              Write-Error "Tailscale executable not found at $tailscaleExe"
+              exit 1
+          }
+
+          Write-Host "Bringing up tailscale..."
+          & $tailscaleExe up --authkey=$authKey --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for Tailscale IPv4
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & $tailscaleExe ip -4
+              $tsIP = $tsIP.Trim()
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned after retries. Exiting."
+              exit 1
+          }
+
+          Write-Host "Tailscale IP detected: $tsIP"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          Write-Host "Testing TCP connectivity to $env:TAILSCALE_IP:3389 ..."
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed (Test-NetConnection result: $($testResult | Out-String))."
+              exit 1
+          }
+          Write-Host "TCP connectivity to RDP port confirmed."
+
+      - name: Maintain Connection (display credentials)
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: Mpragans"
+          Write-Host "Password: 123456"
+          Write-Host "==================`n"
+
+          # Keep runner active until workflow is manually cancelled
+          while ($true) {
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active - use Cancel workflow to terminate"
+              Start-Sleep -Seconds 300
+          }

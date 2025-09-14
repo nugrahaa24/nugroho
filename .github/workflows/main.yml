@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   secure-rdp:
-    runs-on: winku
+    runs-on: winka
     timeout-minutes: 3600
 
     steps:
